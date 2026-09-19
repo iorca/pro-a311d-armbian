@@ -1,0 +1,19 @@
+# 构建/产物 —— 这些永远不该进仓库
+armbian-build/
+output/
+*.img
+*.img.xz
+*.img.sha
+*.img.txt
+*.deb
+*.log
+
+# 临时脚本（本机调试用，不进历史）
+_scratch/
+_tmp/
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+*.swp
+*~

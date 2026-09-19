@@ -1,0 +1,46 @@
+# ============================================================================
+# 强制 LF —— 这不是风格问题，是正确性问题。
+#
+# Windows 的 Git for Windows 默认 core.autocrlf=true，会把 .dts / .patch / .conf /
+# Makefile 在 checkout 时转成 CRLF，后果全部是「静默难查」：
+#   - dtc          → 报莫名其妙的语法错 / 编译出的 dtb 里混入 0x0d
+#   - git apply    → 拒绝应用补丁 (whitespace error)
+#   - Kconfig      → 符号名后面粘上 ^M，变成未定义符号
+#   - shell 脚本   → `#!/bin/bash\r` 报 "bad interpreter"
+#
+# 自检: git ls-files --eol   → 必须全是 i/lf  w/lf
+# ============================================================================
+* text=auto eol=lf
+
+# 文本：显式声明，免得靠内容嗅探
+*.dts     text eol=lf
+*.dtsi    text eol=lf
+*.conf    text eol=lf
+*.inc     text eol=lf
+*.sh      text eol=lf
+*.py      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+Makefile  text eol=lf
+
+# ---------------------------------------------------------------------------
+# 二进制：绝不转换。
+# 放在最后，后面的规则覆盖前面的。
+# ---------------------------------------------------------------------------
+*.bin binary
+*.fw  binary
+*.img binary
+*.xz  binary
+*.gz  binary
+
+# FIP 树里的 x86 加密工具没有扩展名，必须显式标 binary，
+# 否则 text=auto 的内容嗅探有机会动它（改了哪怕一个字节，FIP 就组装不出来）。
+fip/pro-a311d/aml_encrypt_g12b binary
+
+# blx_fix.sh 是文本，保持可 diff（上面的 *.sh text eol=lf 已覆盖，
+# 这里显式重申，免得将来有人往上加 fip/** 的通配规则时误伤）
+fip/pro-a311d/blx_fix.sh    text eol=lf
+fip/pro-a311d/acs_tool.py   text eol=lf
+fip/pro-a311d/Makefile      text eol=lf

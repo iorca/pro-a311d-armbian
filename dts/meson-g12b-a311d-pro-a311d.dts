@@ -1,0 +1,361 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2026 PRO-A311D Armbian bring-up
+ *
+ * 基于 Amlogic W400 参考设计 (A311D) 与上游 Khadas VIM3 主线 DT 改造。
+ * 外设 GPIO / 引脚分配取自厂商 SDK: pro-a311d.dts
+ *
+ * 已按用户指令落实:
+ *   - 删除全部 GPIO 控制供电稳压器 (USB GPIOA_1 / HUB GPIOA_3 /
+ *     风扇 GPIOZ_11 / OTG VBUS GPIOZ_9), 这些口硬件常开, 不做 DT 开关。
+ *   - SD 卡检测改用 cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW> (不再 broken-cd 轮询)。
+ *   - BT 已确认为 AP6256 => compatible "brcm,bcm4345c5"。
+ *   - OTG VBUS / host-device 选择脚已去除, dwc3 固定 dr_mode = "host"。
+ *   - HDMI TX 已打开 (pinctrl hdmitx_hpd_pins)。
+ *   - CPU 动态调压 (DVFS) 已恢复: 板级补两个 pwm-regulator 并接 cpu-supply,
+ *     电源轨 PWM AO CD ch1 (GPIOAO_E) -> cluster0(A53), PWM AB ch0 (GPIOA_E) -> cluster1(A73)。
+ *     电压表取自 vendor W400 BSP (680k-1040k, 反相), OPP 表已覆盖 731k-1011k。
+ *     主线 g12b 全链 (含 VIM3/odroid-n2) 默认不接 cpu-supply, 故须板级补。
+ *
+ * 仍待核对 (不影响 dtb 编过):
+ *   - 大核电压实际路由: 走 PWM AB ch0/GPIOA_E (同 vendor vddcpu1) 还是 PWM AO CD ch0
+ *     (同 VIM3 参考板)? 当前按 vendor vddcpu1 走 pwm_ab。
+ *   - GPIOAO_E/GPIOA_E 是否与核心板原理图一致 (PWM 输出脚)。
+ *   - voltage-table 极性 (反相) 与真实电压表是否一致。
+ *   - BT 三脚极性 (shutdown/device-wakeup/host-wakeup) 是否全部高有效,
+ *     以及 HDMI 5V 是否确实常开 (否则需补 hdmi-supply)。
+ */
+
+/dts-v1/;
+
+#include "meson-g12b-a311d.dtsi"
+#include <dt-bindings/gpio/meson-g12a-gpio.h>
+
+/ {
+	model = "PRO-A311D";
+	compatible = "amlogic,a311d", "amlogic,g12b";
+
+	aliases {
+		serial0 = &uart_AO;	/* 调试串口 ttyAML0 */
+		serial1 = &uart_A;	/* BT  (ttyS1) */
+		serial2 = &uart_C;	/* RS485 (ttyS3) */
+		serial3 = &uart_AO_B;	/* uart1 (ttyS4) */
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		led-run {
+			label = "run";
+			gpios = <&gpio_ao GPIOAO_10 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+	};
+
+	/*
+	 * 电源轨 (bring-up 假设: 常开固定稳压器)
+	 * 真实 PMIC 输出电压/上电顺序需以底板原理图为准。
+	 * vddcpu / vddcpu_a 为 PWM 调压稳压器 (pwm-regulator), 驱动 CPU 核心电压
+	 * 随 OPP 频率调节, 接各 CPU 簇的 cpu-supply。PWM 控制器默认 disabled, 见文件尾 enable。
+	 */
+	vcc_3v3: regulator-vcc-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC_3V3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	vcc_1v8: regulator-vcc-1v8 {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC_1V8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+		regulator-always-on;
+	};
+
+	vcc_card: regulator-vcc-card {
+		compatible = "regulator-fixed";
+		regulator-name = "VCC_CARD";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+	};
+
+	vddcpu: regulator-vddcpu {
+		/*
+		 * cluster0 (A53, cpu0..cpu3) 动态调压.
+		 * pwm-regulator 驱动 PWM AO CD 通道 D (GPIOAO_E, pwm_ao_d_e_pins),
+		 * 接 OPP 表的 cpu-supply. 原始 vendor BSP (mesong12b.dtsi 的
+		 * vddcpu0 = pwm_AO_cd ch1) 即此接法; 主线 g12b 公共链未接 cpu-supply,
+		 * 故板级补上以恢复 DVFS 电压随频调节.
+		 */
+		compatible = "pwm-regulator";
+		regulator-name = "VDDCPU";
+		regulator-min-microvolt = <680000>;
+		regulator-max-microvolt = <1040000>;
+		regulator-always-on;
+		vin-supply = <&vcc_3v3>;
+		pwm-supply = <&vcc_3v3>;
+		pwms = <&pwm_AO_cd 1 1500 0>;
+		pinctrl-0 = <&pwm_ao_d_e_pins>;
+		pinctrl-names = "default";
+		max-duty-cycle = <1500>;
+		/* 占空比 -> 电压映射 (来自 vendor W400 BSP, 反相: 占空比越大电压越低) */
+		voltage-table = <1040000 0>,
+			<1030000 3>,
+			<1020000 6>,
+			<1010000 8>,
+			<1000000 11>,
+			<990000 14>,
+			<980000 17>,
+			<970000 20>,
+			<960000 23>,
+			<950000 26>,
+			<940000 29>,
+			<930000 31>,
+			<920000 34>,
+			<910000 37>,
+			<900000 40>,
+			<890000 43>,
+			<880000 45>,
+			<870000 48>,
+			<860000 51>,
+			<850000 54>,
+			<840000 56>,
+			<830000 59>,
+			<820000 62>,
+			<810000 65>,
+			<800000 68>,
+			<790000 70>,
+			<780000 73>,
+			<770000 76>,
+			<760000 79>,
+			<750000 81>,
+			<740000 84>,
+			<730000 87>,
+			<720000 89>,
+			<710000 92>,
+			<700000 95>,
+			<690000 98>,
+			<680000 100>;
+	};
+
+	vddcpu_a: regulator-vddcpu-a {
+		/*
+		 * cluster1 (A73, cpu100..cpu103) 动态调压.
+		 * pwm-regulator 驱动 PWM AB 通道 A (GPIOA_E, pwm_a_e_pins),
+		 * 接 OPP 表的 cpu-supply. 原始 vendor BSP (vddcpu1 = pwm_ab ch0) 即此接法.
+		 * 待核对: 若 PRO-A311D 大核电压实际走 PWM AO CD 通道 0 (同 VIM3 参考板),
+		 * 改 pwms = <&pwm_AO_cd 0 1500 0> 并将 pinctrl 换为 AO_CD 通道 0 的 pin.
+		 */
+		compatible = "pwm-regulator";
+		regulator-name = "VDDCPU_A";
+		regulator-min-microvolt = <680000>;
+		regulator-max-microvolt = <1040000>;
+		regulator-always-on;
+		vin-supply = <&vcc_3v3>;
+		pwm-supply = <&vcc_3v3>;
+		pwms = <&pwm_ab 0 1500 0>;
+		pinctrl-0 = <&pwm_a_e_pins>;
+		pinctrl-names = "default";
+		max-duty-cycle = <1500>;
+		voltage-table = <1040000 0>,
+			<1030000 3>,
+			<1020000 6>,
+			<1010000 8>,
+			<1000000 11>,
+			<990000 14>,
+			<980000 17>,
+			<970000 20>,
+			<960000 23>,
+			<950000 26>,
+			<940000 29>,
+			<930000 31>,
+			<920000 34>,
+			<910000 37>,
+			<900000 40>,
+			<890000 43>,
+			<880000 45>,
+			<870000 48>,
+			<860000 51>,
+			<850000 54>,
+			<840000 56>,
+			<830000 59>,
+			<820000 62>,
+			<810000 65>,
+			<800000 68>,
+			<790000 70>,
+			<780000 73>,
+			<770000 76>,
+			<760000 79>,
+			<750000 81>,
+			<740000 84>,
+			<730000 87>,
+			<720000 89>,
+			<710000 92>,
+			<700000 95>,
+			<690000 98>,
+			<680000 100>;
+	};
+
+	/*
+	 * 不需要供电控制: 删除 USB 供电(GPIOA_1) / HUB 复位(GPIOA_3) /
+	 * 风扇(GPIOZ_11) / OTG VBUS(GPIOZ_9) 四个 GPIO 控制稳压器。
+	 * 这些口默认由硬件常开供电 (或固定稳压器), 不由 DT 通过 GPIO 开关。
+	 */
+};
+
+/* 调试串口 (ttyAML0) */
+&uart_AO {
+	status = "okay";
+};
+
+/* BT: ttyS1, AP6256 (Broadcom BCM4345C5, SDIO Wi-Fi + UART BT 二合一) */
+&uart_A {
+	status = "okay";
+	pinctrl-0 = <&uart_a_pins>, <&uart_a_cts_rts_pins>;
+	pinctrl-names = "default";
+
+	/*
+	 * AP6256: GPIO 取自 SDK rp_power:
+	 *   reset/btdown = GPIOA_6   -> shutdown-gpios (拉高复位)
+	 *   btwakeup     = GPIOA_5   -> device-wakeup-gpios (host 唤醒模块)
+	 *   hostwake     = GPIOX_19  -> host-wakeup-gpios (模块唤醒 host)
+	 * 极性按 Broadcom binding 默认 GPIO_ACTIVE_HIGH (拉高有效)。
+	 * 待核对: 若底板该口复位为低有效, 改为 GPIO_ACTIVE_LOW。
+	 */
+	bluetooth {
+		compatible = "brcm,bcm4345c5";
+		shutdown-gpios = <&gpio GPIOA_6 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&gpio GPIOA_5 GPIO_ACTIVE_HIGH>;
+		host-wakeup-gpios = <&gpio GPIOX_19 GPIO_ACTIVE_HIGH>;
+	};
+};
+
+/* RS485: ttyS3 */
+&uart_C {
+	status = "okay";
+	pinctrl-0 = <&uart_c_pins>;
+	pinctrl-names = "default";
+};
+
+/* uart1: ttyS4 */
+&uart_AO_B {
+	status = "okay";
+	/* 待核对引脚组: 默认 2/3 脚; 若底板用 8/9 脚改为 uart_ao_b_8_9_pins */
+	pinctrl-0 = <&uart_ao_b_2_3_pins>;
+	pinctrl-names = "default";
+};
+
+/* RTC: HYM8563 @0x51 on i2c_AO (SDK &i2c_AO) */
+&i2c_AO {
+	status = "okay";
+	pinctrl-0 = <&i2c_ao_sck_pins>, <&i2c_ao_sda_pins>;
+	pinctrl-names = "default";
+	clock-frequency = <100000>;
+
+	hym8563: rtc@51 {
+		compatible = "haoyu,hym8563";
+		reg = <0x51>;
+		#clock-cells = <0>;
+	};
+};
+
+/* 内部 PHY 以太网 (RMII).
+ * SDK 用 vendor 属性 internal_phy=<1>; 主线用 phy-handle 指向 internal_ephy。
+ * internal_ephy 定义在 meson-g12-common.dtsi:1727 (ethernet-phy@8, max-speed 100)。 */
+&ethmac {
+	status = "okay";
+	phy-handle = <&internal_ephy>;
+	phy-mode = "rmii";
+};
+
+/* eMMC (rootfs) */
+&sd_emmc_c {
+	status = "okay";
+	pinctrl-0 = <&emmc_ctrl_pins>, <&emmc_data_8b_pins>, <&emmc_ds_pins>;
+	pinctrl-1 = <&emmc_clk_gate_pins>;
+	pinctrl-names = "default", "clk-gate";
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	mmc-ddr-1_8v;
+	mmc-hs200-1_8v;
+	max-frequency = <200000000>;
+	disable-wp;
+	vmmc-supply = <&vcc_3v3>;
+	vqmmc-supply = <&vcc_1v8>;
+	non-removable;
+	disables-sd;
+};
+
+/* SD 卡 */
+&sd_emmc_b {
+	status = "okay";
+	pinctrl-0 = <&sdcard_c_pins>;
+	pinctrl-1 = <&sdcard_clk_gate_c_pins>;
+	pinctrl-names = "default", "clk-gate";
+	bus-width = <4>;
+	cap-sd-highspeed;
+	max-frequency = <50000000>;
+	disable-wp;
+	vmmc-supply = <&vcc_card>;
+	vqmmc-supply = <&vcc_card>;
+	cd-gpios = <&gpio GPIOC_6 GPIO_ACTIVE_LOW>;
+	/*
+	 * 注意: 若 GPIOC 不作为 SDIO 口使用, 系统启动阶段不要把
+	 * CARD_DET(GPIOC_6) 拉低, 否则 romcode 会尝试从 SD 卡启动
+	 * (误判为可启动介质)。此处 GPIO_ACTIVE_LOW 表示插入时拉低,
+	 * 拔出为高; 请确保上电默认电平为高 (未插入态)。
+	 */
+};
+
+/* USB2/USB3 复合控制器 (纯 host, 不接 OTG VBUS / 不接 host-device 选择脚) */
+&usb {
+	status = "okay";
+};
+
+&dwc3 {
+	status = "okay";
+	dr_mode = "host";
+};
+
+/* HDMI TX 输出 (接底板 HDMI 座) */
+&hdmi_tx {
+	status = "okay";
+	pinctrl-0 = <&hdmitx_hpd_pins>;
+	pinctrl-names = "default";
+	/*
+	 * 注意: 若底板 HDMI 5V 由 GPIO 控制稳压器供电 (如 vim3 的 VCC_5V),
+	 * 需在此加 hdmi-supply = <&vcc_5v>; 本板假设 HDMI 5V 常开,
+	 * 故省略。 若热插拔不识别, 优先核对 HPD 脚 (hdmitx_hpd_pins) 电平。
+	 */
+};
+
+/*
+ * CPU 动态调压所需 PWM 控制器: 主线默认 disabled, 必须板级 enable。
+ * vddcpu 用 PWM AO CD (通道 D, GPIOAO_E), vddcpu_a 用 PWM AB (GPIOA_E)。
+ */
+&pwm_AO_cd {
+	status = "okay";
+};
+
+&pwm_ab {
+	status = "okay";
+	pinctrl-0 = <&pwm_a_e_pins>;
+	pinctrl-names = "default";
+};
+
+/*
+ * 把两个 pwm-regulator 接到 CPU 簇的 cpu-supply, 让 OPP 表驱动电压随频调节。
+ * A311D = 2×A53 (cluster0: cpu0/cpu1) + 4×A73 (cluster1: cpu100..cpu103)。
+ */
+&cpu0   { cpu-supply = <&vddcpu>; };
+&cpu1   { cpu-supply = <&vddcpu>; };
+&cpu100 { cpu-supply = <&vddcpu_a>; };
+&cpu101 { cpu-supply = <&vddcpu_a>; };
+&cpu102 { cpu-supply = <&vddcpu_a>; };
+&cpu103 { cpu-supply = <&vddcpu_a>; };

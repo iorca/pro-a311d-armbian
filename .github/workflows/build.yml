@@ -1,0 +1,313 @@
+# ============================================================================
+# PRO-A311D —— GitHub Actions 云端编译
+#
+# 两种触发:
+#   * push (只跑 validate): 校验 dts/脚本 LF、FIP 树完整性、YAML 语法。
+#     秒级反馈，防的是「CRLF / 丢 +x 位 / 少一个固件」这类**静默**故障。
+#   * workflow_dispatch (手动): 真正的编译。Actions 页面 → 本 workflow → Run workflow。
+#
+# 为什么 push 不自动跑全量: 一次全量 ~2.5 小时。改一行 dts 就烧两个小时不合理。
+# 需要持续集成的话，把下面 build job 的 if 条件改成也接受 push 即可。
+#
+# 关键实现说明（踩过的坑，别改回去）:
+#
+# 1) 必须 root 跑: run: 步骤的 stdin 不是 tty，所以 armbian 的
+#      lib/functions/cli/utils-cli.sh 里那个 "don't run as root" 只是**告警**后继续
+#      （源码: if [[ -t 0 ]]; then exit_if_countdown_not_aborted 10; fi）。
+#    再显式给 ALLOW_ROOT=yes 把告警也消掉。
+#    若以非 root 跑，会走 else 分支 → 检测到 runner 有 Docker → **转去 Docker 里编译**，
+#    多一层黑盒，没必要。
+#
+# 2) 交互门控必须走 env，不能放命令行: KERNEL_CONFIGURE / UBOOT_CONFIGURE 放命令行会被
+#    CLI 白名单**静默丢弃**（日志 "Repeat Build Options" 行里看不到它们就是被丢了）。
+#    放 env + sudo -E 才生效。
+#
+# 3) 落点逻辑不在 YAML 里重写，调用仓库的 scripts/deploy-to-build.sh ——
+#    本地和 CI 共用同一份，避免两处漂移。
+#
+# 4) COMPRESS_OUTPUTIMAGE=sha,xz: 未压缩镜像 ~2.4 GB，**超过 GitHub Release 单文件
+#    2 GB 上限**，必须压。xz 后约 700 MB~1 GB。
+#
+# 5) 编译后一定跑 scripts/verify-output.sh。armbian 的 artifact 缓存会在**零报错**
+#    的情况下让镜像缺本板 dtb，只看构建结果（绿色 ✔）是判断不出来的。
+# ============================================================================
+
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact:
+        description: '编译目标 (kernel-dtb = 只编设备树, 几分钟, 用来快速验 dts 落点)'
+        type: choice
+        options: ['build', 'kernel-dtb', 'kernel', 'uboot']
+        default: 'build'
+      branch:
+        description: '内核分支'
+        type: choice
+        options: ['current', 'edge']
+        default: 'current'
+      release:
+        description: '发行版'
+        type: choice
+        options: ['bookworm', 'noble', 'trixie']
+        default: 'bookworm'
+      build_ref:
+        description: 'armbian/build 的 ref (分支 / 标签 / commit SHA)'
+        type: string
+        default: 'main'
+      create_release:
+        description: '编译完成后创建 Release 并上传产物'
+        type: boolean
+        default: true
+
+  push:
+    branches: [main]
+    paths:
+      - 'userpatches/**'
+      - 'dts/**'
+      - 'fip/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+
+# 翻译成"能建 Release"的权限；checkout 用默认的 contents:read 即可
+permissions:
+  contents: write
+
+# 两个重活别并排跑（每个 job 自带独立 workspace，是怕重复触发白烧两小时）
+concurrency:
+  group: pro-a311d-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  # --------------------------------------------------------------------------
+  # validate: 秒级静态检查，push 和手动都会跑
+  # --------------------------------------------------------------------------
+  validate:
+    name: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 行尾必须是 LF
+        run: |
+          set -euo pipefail
+          # .gitattributes 的 eol=lf 只影响 checkout 时的转换；这里直接查 index 里存的是什么。
+          # 混进 CRLF 的后果全是静默的: dtc 报错 / git apply 拒绝 / Kconfig 混入 ^M。
+          # 二进制在 --eol 里显示 i/-text，不算违规。
+          git ls-files --eol
+          BAD="$(git ls-files --eol | awk '$1 != "i/lf" && $1 != "i/-text" {print}' || true)"
+          if [[ -n "${BAD}" ]]; then
+            echo "::error::以下文件在 git index 里既不是 LF 也不是二进制:"
+            echo "${BAD}"
+            exit 1
+          fi
+          echo "全部 i/lf 或 i/-text ✓"
+
+      - name: FIP 树完整性 + 可执行位
+        run: |
+          set -euo pipefail
+          D=fip/pro-a311d
+          # uboot_g12_postprocess 会逐个引用这些文件，缺一个就 Error 127 / 组装出半成品 FIP
+          for f in bl2.bin bl30.bin bl301.bin bl31.img acs.bin blx_fix.sh aml_encrypt_g12b \
+                   aml_ddr.fw ddr3_1d.fw ddr4_1d.fw ddr4_2d.fw diag_lpddr4.fw \
+                   lpddr3_1d.fw lpddr4_1d.fw lpddr4_2d.fw piei.fw; do
+            [[ -e "$D/$f" ]] || { echo "::error::FIP 树缺文件: $D/$f"; exit 1; }
+          done
+          echo "FIP 文件齐 ✓"
+
+          # git 必须把 blx_fix.sh / aml_encrypt_g12b 记成 100755。
+          # Windows 上 add 会丢掉 +x（NTFS 没有这个位），必须
+          #   git update-index --chmod=+x <file>
+          # 少了它，Linux runner 上 uboot_g12_postprocess 直接 Permission denied。
+          for f in blx_fix.sh aml_encrypt_g12b; do
+            MODE="$(git ls-files -s "$D/$f" | awk '{print $1}')"
+            echo "$D/$f mode=$MODE"
+            [[ "$MODE" == "100755" ]] || { echo "::error::$D/$f 不是 100755 (实际 $MODE)。修: git update-index --chmod=+x $D/$f"; exit 1; }
+          done
+          echo "可执行位 ✓"
+
+          SZ="$(find "$D" -type f -printf '%s\n' | awk '{s+=$1} END {print s}')"
+          echo "FIP 树合计 ${SZ} B（期望 2793718）"
+
+      - name: shell / YAML 语法
+        run: |
+          set -euo pipefail
+          for s in scripts/*.sh; do bash -n "$s" && echo "bash -n OK: $s"; done
+          python3 - <<'PY'
+          import sys, yaml, pathlib
+          for p in pathlib.Path('.github/workflows').glob('*.yml'):
+              yaml.safe_load(p.read_text())
+              print(f"yaml OK: {p}")
+          PY
+
+      - name: dts 冒烟检查（关键节点是否还在）
+        run: |
+          set -euo pipefail
+          D=dts/meson-g12b-a311d-pro-a311d.dts
+          [[ -f "$D" ]] || { echo "::error::缺 $D"; exit 1; }
+          # 不是完整编译（完整编译要内核头文件），只查这些"删了就起不来"的东西还在不在
+          for pat in 'compatible = "amlogic,a311d"' 'model = "PRO-A311D"' \
+                     'cpu-supply' 'pwm-regulator' 'voltage-table' \
+                     'brcm,bcm4345c5' 'cd-gpios' 'status = "okay"'; do
+            grep -q "$pat" "$D" || { echo "::error::$D 里找不到: $pat"; exit 1; }
+            echo "  ✓ $pat"
+          done
+          echo "dts 冒烟检查通过 ✓"
+
+  # --------------------------------------------------------------------------
+  # build: 真正的编译，只在手动触发时跑
+  # --------------------------------------------------------------------------
+  build:
+    name: build (${{ inputs.artifact }} / ${{ inputs.branch }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    env:
+      BOARD: pro-a311d
+      BRANCH: ${{ inputs.branch }}
+      RELEASE: ${{ inputs.release }}
+      ARTIFACT: ${{ inputs.artifact }}
+
+      # --- armbian 交互门控（必须 env，放命令行会被静默丢弃）---
+      EXPERT: "yes"
+      KERNEL_CONFIGURE: "no"
+      UBOOT_CONFIGURE: "no"
+      BUILD_DESKTOP: "no"          # 板子 bring-up 阶段先出 CLI 镜像
+      BUILD_MINIMAL: "no"          # BUILD_DESKTOP=no 时仍需本变量非空，否则仍会弹菜单
+      ALLOW_ROOT: "yes"            # stdin 非 tty 时本就是告警后继续，这里顺手把告警消掉
+      PREFER_DOCKER: "no"
+
+      COMPRESS_OUTPUTIMAGE: "sha,xz"   # 2.4 GB > Release 单文件 2 GB 上限，必须压
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 腾磁盘
+        run: |
+          set -euo pipefail
+          # Armbian 一套下来 25~40 GB（内核 worktree + rootfs + 镜像 + deb）
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 取 armbian/build
+        run: |
+          set -euo pipefail
+          REF='${{ inputs.build_ref }}'
+          if [[ "${REF}" =~ ^[0-9a-f]{7,40}$ ]]; then
+            # commit SHA: --branch 不接受，得全量 clone 再 checkout
+            git clone https://github.com/armbian/build.git armbian-build
+            git -C armbian-build checkout "${REF}"
+          else
+            git clone --depth 1 --branch "${REF}" https://github.com/armbian/build.git armbian-build
+          fi
+          git -C armbian-build rev-parse HEAD | tee armbian-build-rev.txt
+          echo "armbian/build ref = ${REF}"
+
+      - name: 落 overlay 到 armbian-build
+        run: bash scripts/deploy-to-build.sh --branch "${BRANCH}" armbian-build
+
+      - name: 编译 (${{ inputs.artifact }})
+        run: |
+          set -euo pipefail
+          cd armbian-build
+          chmod +x compile.sh
+          echo "=========== armbian CLI 参数 ==========="
+          echo "artifact=${ARTIFACT} BOARD=${BOARD} BRANCH=${BRANCH} RELEASE=${RELEASE}"
+          echo "========================================"
+          # 不加 --dry-run/$@: 26.x 的 artifact 是位置参数
+          sudo -E ./compile.sh "${ARTIFACT}" BOARD="${BOARD}" BRANCH="${BRANCH}" RELEASE="${RELEASE}"
+
+      - name: 验收产物（失败即让整个 job 红）
+        run: sudo -E bash scripts/verify-output.sh armbian-build "${BOARD}"
+
+      - name: 构建摘要
+        if: always()
+        run: |
+          {
+            echo "## PRO-A311D \`${{ inputs.artifact }}\` 构建摘要"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| armbian/build ref | \`${{ inputs.build_ref }}\` — \`$(cat armbian-build-rev.txt 2>/dev/null || echo n/a)\` |"
+            echo "| BOARD / BRANCH / RELEASE | \`${BOARD}\` / \`${BRANCH}\` / \`${RELEASE}\` |"
+            echo "| run | #${{ github.run_number }} |"
+            echo ""
+            echo "### 产物"
+            echo '```'
+            ls -lh armbian-build/output/images/ 2>/dev/null || echo "(no images)"
+            echo '---'
+            ls -lh armbian-build/output/debs/*.deb 2>/dev/null || echo "(no debs)"
+            echo '```'
+            echo "### dtb 落点检查"
+            echo '```'
+            DTB_DEB=$(ls -t armbian-build/output/debs/linux-dtb-*-meson64_*.deb 2>/dev/null | head -1)
+            if [ -n "$DTB_DEB" ]; then
+              dpkg-deb -c "$DTB_DEB" | grep -E 'pro-a311d|\.dtb$' | head -20
+            else
+              echo "(no dtb deb)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 传日志（失败时最有用）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ inputs.artifact }}-${{ github.run_number }}
+          path: |
+            armbian-build/output/logs/
+            armbian-build/output/images/*.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: 发布 Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          FILES=()
+          # 显式列目录内容再筛，不用 glob 直传给上传命令（不会展开）
+          while IFS= read -r f; do
+            [[ -n "$f" ]] && FILES+=("$f")
+          done < <(ls -1 armbian-build/output/images/*.img.xz \
+                        armbian-build/output/images/*.img.sha \
+                        armbian-build/output/images/*.img.txt \
+                        armbian-build/output/debs/*.deb 2>/dev/null || true)
+
+          if [[ ${#FILES[@]} -eq 0 ]]; then
+            echo "::error::没有任何产物可发布"
+            exit 1
+          fi
+
+          TAG="build-$(date -u +%Y%m%d-%H%M)-r${{ github.run_number }}"
+
+          cat > /tmp/notes.md <<EOF
+          PRO-A311D (Amlogic A311D, W400) Armbian 非官方构建
+
+          - artifact: \`${{ inputs.artifact }}\`
+          - armbian/build: \`${{ inputs.build_ref }}\` @ \`$(cat armbian-build-rev.txt)\`
+          - BOARD/BRANCH/RELEASE: \`${BOARD}\` / \`${BRANCH}\` / \`${RELEASE}\`
+          - 由 workflow run #${{ github.run_number }} 生成
+
+          烧写: 解压 \`.img.xz\` 后整盘写 (\`rkdeveloptool\` 不适用本 SoC;
+          Amlogic 走 \`dd\` 到 SD/eMMC 或以 \`aml_encrypt\` 产物烧)
+          EOF
+
+          printf '将上传 %d 个文件:\n' "${#FILES[@]}"
+          printf '  %s\n' "${FILES[@]}"
+
+          gh release create "${TAG}" \
+            --title "PRO-A311D ${BRANCH} ${RELEASE} (${{ inputs.artifact }})" \
+            --notes-file /tmp/notes.md \
+            "${FILES[@]}"
+
+          echo "Release: ${TAG}"
