@@ -8,6 +8,11 @@ output/
 *.deb
 *.log
 
+# !! 上面的 *.img 会连 fip/ 里的固件一起吃掉 —— fip/pro-a311d/bl31.img 就是被它
+#    忽略掉的, 导致首次推送时 FIP 树少一个文件 (CI 的 validate job 当场抓到:
+#    "FIP 树缺文件: fip/pro-a311d/bl31.img")。否定规则必须写在后面才生效。
+!fip/pro-a311d/bl31.img
+
 # 临时脚本（本机调试用，不进历史）
 _scratch/
 _tmp/

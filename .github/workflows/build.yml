@@ -115,7 +115,21 @@ jobs:
                    lpddr3_1d.fw lpddr4_1d.fw lpddr4_2d.fw piei.fw; do
             [[ -e "$D/$f" ]] || { echo "::error::FIP 树缺文件: $D/$f"; exit 1; }
           done
-          echo "FIP 文件齐 ✓"
+          echo "FIP 必需文件齐 ✓"
+
+          # 数量硬断言。文件明明在磁盘上却漏了，几乎只有一个原因: 被 .gitignore 吃掉 ——
+          # 实测踩过一次: 顶层 `*.img` 把 fip/pro-a311d/bl31.img (供应商 bl31 固件) 一起忽略了,
+          # 本机看着好好的, CI 上才缺文件。磁盘上有 19 个, git 里也必须 19 个。
+          DISK="$(find "$D" -maxdepth 1 -type f | wc -l)"
+          TRACKED="$(git ls-files "$D" | wc -l)"
+          echo "磁盘 $DISK 个 / git 跟踪 $TRACKED 个"
+          if [[ "$DISK" != "$TRACKED" ]]; then
+            echo "::error::磁盘上有 $DISK 个文件但 git 只跟踪 $TRACKED 个 —— 有文件被 .gitignore 忽略了"
+            git status --short --ignored "$D" || true
+            exit 1
+          fi
+          [[ "$TRACKED" == "19" ]] || { echo "::error::FIP 树应为 19 个文件, 实际 $TRACKED 个"; exit 1; }
+          echo "FIP 文件数 19 ✓"
 
           # git 必须把 blx_fix.sh / aml_encrypt_g12b 记成 100755。
           # Windows 上 add 会丢掉 +x（NTFS 没有这个位），必须
@@ -129,7 +143,7 @@ jobs:
           echo "可执行位 ✓"
 
           SZ="$(find "$D" -type f -printf '%s\n' | awk '{s+=$1} END {print s}')"
-          echo "FIP 树合计 ${SZ} B（期望 2793718）"
+          echo "FIP 树合计 ${SZ} B（实测参考值 2793718 B）"
 
       - name: shell / YAML 语法
         run: |
