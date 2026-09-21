@@ -114,7 +114,20 @@ step "0/4 检查输入"
 
 AB="$(cd "${AB}" && pwd)" || die "armbian-build 目录不存在: ${AB}"
 [[ -f "${AB}/compile.sh" ]] || die "${AB} 里没有 compile.sh —— 不是 armbian/build 树?"
-[[ -d "${AB}/userpatches" ]] || die "${AB} 里没有 userpatches/ —— 不是 armbian/build 树?"
+
+# userpatches/ 在 armbian/build 的 git 仓库里**不存在**，fresh clone 之后不会有这个目录。
+# 证据: .gitignore 第 19 行是 `/userpatches`，`git ls-files userpatches` 返回 0 个文件，
+#       `git ls-tree HEAD userpatches/` 为空。
+# 它由 armbian 运行时自己创建:
+#   lib/functions/cli/entrypoint.sh:128   mkdir -p "${DEST}" "${USERPATCHES_PATH}"
+#   lib/functions/host/prepare-host.sh:95 mkdir -p ... "${USERPATCHES_PATH}" ...
+# 我们在 compile.sh 之前就要往里落 overlay，所以必须自己先建出来。
+#
+# 踩过: 这里原先是 `[[ -d "${AB}/userpatches" ]] || die ...`。
+# 本机（跑过编译，armbian 早替我们建好了）永远不会触发；CI fresh clone 上 100% 触发，
+# 表现为 build job 的"落 overlay"步骤 0 秒 exit 1，编译和验收被 skip。
+# 教训: 断言"上游树里有什么"之前，先想清楚它是不是 gitignore 的 —— 本地有、clone 后没有。
+mkdir -p "${AB}/userpatches"
 
 # 逃生舱: 环境变量 KERNELPATCHDIR 显式指定时直接用, 不做派生
 # （上游把 meson64_common.inc 结构大改、派生失败时, 先用它跑通, 再回头修派生逻辑）
