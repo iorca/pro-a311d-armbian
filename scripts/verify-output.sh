@@ -122,8 +122,19 @@ fi
 
 # ------------------------------------------------------------------- ③ image
 head_ "③ 镜像里的 /boot/dtb/amlogic/"
-IMG="$(ls -t "${AB}"/output/images/*"${BOARD}"*.img 2>/dev/null | head -1)"
-IMGXZ="$(ls -t "${AB}"/output/images/*"${BOARD}"*.img.xz 2>/dev/null | head -1)"
+# armbian 生成的文件名里 board 是**首字母大写**的（board=pro-a311d → 文件名 Pro-a311d），
+# 跟 ${BOARD} 变量的大小写对不上。这里曾经写的是 *"${BOARD}"*.img，
+# 结果这一项**永远 skip** —— "镜像里到底有没有本板 dtb"这个端到端判据静默失效，
+# 比没有还糟（看着像验过了）。必须大小写不敏感（-iname），并按下述规则取最新产物。
+IMG_DIR="${AB}/output/images"
+pick_newest() { # $1 = 后缀 glob，如 '.img'
+	find "${IMG_DIR}" -maxdepth 1 -iname "*${BOARD}*$1" -printf '%T@\t%p\n' 2>/dev/null |
+		sort -rn | head -1 | cut -f2-
+}
+IMG="$(pick_newest '.img')"
+IMGXZ="$(pick_newest '.img.xz')"
+# 谁新用谁：磁盘上可能还躺着上一次的旧 .img，不能让它替这次新出的 .img.xz 作证
+if [[ -n "${IMGXZ}" && ( -z "${IMG}" || "${IMGXZ}" -nt "${IMG}" ) ]]; then IMG=""; fi
 
 if [[ -n "${IMG}" ]]; then
 	echo "  镜像: $(basename "${IMG}")  ($(du -h "${IMG}" | cut -f1))"
@@ -164,9 +175,9 @@ if [[ -n "${IMG}" ]]; then
 	fi
 elif [[ -n "${IMGXZ}" ]]; then
 	echo "  镜像(压缩): $(basename "${IMGXZ}")  ($(du -h "${IMGXZ}" | cut -f1))"
-	skip "只有 .img.xz，跳过挂载实测（①②已能拦住 dtb 缺失）"
+	skip "最新产物是 .img.xz，跳过挂载实测（要端到端验证: xz -dc 解出来再 sudo 重跑本项）"
 else
-	skip "output/images/ 里没有本板镜像"
+	skip "output/images/ 里没有本板镜像（匹配 *${BOARD}*.img / *.img.xz，大小写不敏感）"
 fi
 
 # ------------------------------------------------------------------ ④ u-boot
